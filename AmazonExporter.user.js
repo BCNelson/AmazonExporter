@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.2
+// @version      0.5.0
 // @description  Export Amazon order history to JSON/CSV
-// @author       IeuanK
-// @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
-// @updateURL    https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
-// @downloadURL  https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
-// @supportURL   https://github.com/IeuanK/AmazonExporter/issues
+// @author       bcnelson
+// @url          https://github.com/bcnelson/AmazonExporter/raw/main/AmazonExporter.user.js
+// @updateURL    https://github.com/bcnelson/AmazonExporter/raw/main/AmazonExporter.user.js
+// @downloadURL  https://github.com/bcnelson/AmazonExporter/raw/main/AmazonExporter.user.js
+// @supportURL   https://github.com/bcnelson/AmazonExporter/issues
 // @match        https://www.amazon.com/*
 // @match        https://www.amazon.de/*
 // @match        https://www.amazon.co.uk/*
@@ -26,6 +26,8 @@
         captures: 0,
         lastOrder: null,
         orders: {},
+        transactions: {},        // NEW: keyed by transactionId
+        transactionCaptures: 0,  // NEW: count of transaction page captures
     };
 
     const conLog = (...args) => {
@@ -40,6 +42,13 @@
         const saved = localStorage.getItem(STATE_KEY);
         if (saved) {
             state = JSON.parse(saved);
+            // Ensure transactions object exists (for backward compatibility)
+            if (!state.transactions) {
+                state.transactions = {};
+            }
+            if (!state.transactionCaptures) {
+                state.transactionCaptures = 0;
+            }
         }
         return state;
     };
@@ -56,12 +65,29 @@
 
     // Check if we can proceed with operations
     const checkReadiness = () => {
+        // On transactions page, we don't need pagination
+        if (isTransactionsPage()) {
+            return true;
+        }
         const pagination = isPaginationLoaded();
-        const buttons = document.querySelectorAll("button");
-        buttons.forEach(button => {
-            button.disabled = !pagination;
-        });
+        const panel = document.querySelector("#amazon-exporter-panel");
+        if (panel) {
+            const buttons = panel.querySelectorAll("button");
+            buttons.forEach(button => {
+                button.disabled = !pagination;
+            });
+        }
         return pagination;
+    };
+
+    // Page detection
+    const isOrdersPage = () => {
+        return window.location.href.match(/\/your-orders\/orders/) ||
+               window.location.href.match(/\/order-history/);
+    };
+
+    const isTransactionsPage = () => {
+        return window.location.href.match(/\/cpe\/yourpayments\/transactions/);
     };
 
     // URL handling
@@ -115,9 +141,73 @@
         return [headers.join(","), ...rows.map(row => row.join(","))].join("\n");
     };
 
+    // Build export data with transactions linked to orders
+    const buildExportData = () => {
+        const rawState = loadState();
+
+        // Ensure transactions object exists
+        const transactions = rawState.transactions || {};
+        const orders = rawState.orders || {};
+
+        // Group transactions by orderId
+        const transactionsByOrder = {};
+        for (const txId in transactions) {
+            const tx = transactions[txId];
+            if (!transactionsByOrder[tx.orderId]) {
+                transactionsByOrder[tx.orderId] = [];
+            }
+            transactionsByOrder[tx.orderId].push({
+                transactionDate: tx.transactionDate,
+                amount: tx.amount,
+                currency: tx.currency,
+                paymentMethod: tx.paymentMethod,
+                merchant: tx.merchant,
+            });
+        }
+
+        // Build export orders object
+        const exportOrders = {};
+
+        // First, add all captured orders with hasOrderDetails: true
+        for (const orderId in orders) {
+            const order = orders[orderId];
+            exportOrders[orderId] = {
+                ...order,
+                hasOrderDetails: true,
+                transactions: transactionsByOrder[orderId] || [],
+            };
+        }
+
+        // Then, add stub orders for transactions without matching orders
+        for (const orderId in transactionsByOrder) {
+            if (!exportOrders[orderId]) {
+                // Create stub order entry
+                exportOrders[orderId] = {
+                    orderId: orderId,
+                    hasOrderDetails: false,
+                    totalPrice: null,
+                    currency: null,
+                    orderDate: null,
+                    itemCount: null,
+                    items: [],
+                    transactions: transactionsByOrder[orderId],
+                };
+            }
+        }
+
+        return {
+            lastUpdate: rawState.lastUpdate,
+            total: Object.keys(exportOrders).length,
+            captures: rawState.captures || 0,
+            transactionCaptures: rawState.transactionCaptures || 0,
+            lastOrder: rawState.lastOrder,
+            orders: exportOrders,
+        };
+    };
+
     // JSON export
     const getJSON = () => {
-        return loadState();
+        return buildExportData();
     };
 
     // Get item details including quantity
@@ -414,9 +504,176 @@
 
         return tracking.captured > 0;
     };
+
+    // Transaction capture for /cpe/yourpayments/transactions page
+    const captureTransactions = async (captureButton) => {
+        captureButton.disabled = true;
+        const tracking = {
+            total: 0,
+            captured: 0,
+            failed: 0,
+            skipped: 0,
+        };
+
+        const statusSpan = document.querySelector(".capture-status");
+        const updateStatus = () => {
+            if (statusSpan) {
+                statusSpan.textContent = `${tracking.captured}/${tracking.total} transactions captured, ${tracking.failed} failed, ${tracking.skipped} skipped`;
+            }
+        };
+
+        loadState();
+
+        const newTransactions = {};
+
+        // Find all transaction line items
+        const transactionContainers = document.querySelectorAll('.apx-transactions-line-item-component-container');
+        if (!transactionContainers.length) {
+            conLog("No transactions found on page");
+            captureButton.disabled = false;
+            return false;
+        }
+
+        tracking.total = transactionContainers.length;
+
+        for (const container of transactionContainers) {
+            try {
+                // Find the date by looking for the nearest preceding date container
+                // Walk up to find the parent that contains this transaction, then look for date sibling
+                let currentDate = null;
+                let parent = container.parentElement;
+                while (parent && !currentDate) {
+                    // Check previous siblings for date container
+                    let sibling = parent.previousElementSibling;
+                    while (sibling) {
+                        if (sibling.classList.contains('apx-transaction-date-container')) {
+                            const dateSpan = sibling.querySelector('span');
+                            if (dateSpan) {
+                                currentDate = dateSpan.textContent.trim();
+                                break;
+                            }
+                        }
+                        // Also check if sibling contains a date container
+                        const dateElem = sibling.querySelector('.apx-transaction-date-container span');
+                        if (dateElem) {
+                            currentDate = dateElem.textContent.trim();
+                            break;
+                        }
+                        sibling = sibling.previousElementSibling;
+                    }
+                    parent = parent.parentElement;
+                }
+
+                if (!currentDate) {
+                    currentDate = "Unknown";
+                }
+
+                // Extract payment method (e.g., "Visa ****6882")
+                const paymentMethodElem = container.querySelector('.a-column.a-span9 .a-size-base.a-text-bold');
+                if (!paymentMethodElem) {
+                    throw new Error("Could not find payment method");
+                }
+                const paymentMethod = paymentMethodElem.textContent.trim();
+
+                // Extract amount (e.g., "-$16.11")
+                const amountElem = container.querySelector('.a-column.a-span3 .a-size-base-plus.a-text-bold');
+                if (!amountElem) {
+                    throw new Error("Could not find amount");
+                }
+                const amountText = amountElem.textContent.trim();
+                // Parse amount and currency
+                const currencyMatch = amountText.match(/^([+-]?)([€$£]|EUR|USD|GBP)?(.+)$/);
+                let amount = 0;
+                let currency = "USD";
+                if (currencyMatch) {
+                    const sign = currencyMatch[1] === '-' ? -1 : 1;
+                    const currencySymbol = currencyMatch[2] || '$';
+                    const amountStr = currencyMatch[3].replace(/[^0-9.,]/g, "").replace(",", ".");
+                    amount = sign * parseFloat(amountStr);
+                    if (currencySymbol === '€' || currencySymbol === 'EUR') currency = "EUR";
+                    else if (currencySymbol === '£' || currencySymbol === 'GBP') currency = "GBP";
+                    else currency = "USD";
+                }
+
+                // Extract order ID from link
+                const orderLink = container.querySelector('a[href*="orderID="]');
+                if (!orderLink) {
+                    throw new Error("Could not find order ID link");
+                }
+                const orderIdMatch = orderLink.href.match(/orderID=([^&]+)/);
+                if (!orderIdMatch) {
+                    throw new Error("Could not parse order ID from link");
+                }
+                const orderId = orderIdMatch[1];
+
+                // Extract merchant (last .a-size-base element that's not the payment method)
+                const merchantElems = container.querySelectorAll('.a-size-base');
+                let merchant = "Unknown";
+                if (merchantElems.length > 0) {
+                    // The merchant is typically in the last section
+                    const lastMerchant = merchantElems[merchantElems.length - 1];
+                    if (lastMerchant && !lastMerchant.classList.contains('a-text-bold')) {
+                        merchant = lastMerchant.textContent.trim();
+                    }
+                }
+
+                // Generate unique transaction ID
+                const transactionId = `${orderId}_${currentDate}_${amount}`;
+
+                // Skip if already captured
+                if (state.transactions[transactionId]) {
+                    tracking.skipped++;
+                    container.style.border = "2px solid #ffa500";
+                    updateStatus();
+                    continue;
+                }
+
+                // Parse the transaction date
+                const transactionDate = parseOrderDate(currentDate);
+
+                newTransactions[transactionId] = {
+                    transactionId: transactionId,
+                    orderId: orderId,
+                    transactionDate: transactionDate,
+                    amount: Math.abs(amount), // Store as positive number
+                    currency: currency,
+                    paymentMethod: paymentMethod,
+                    merchant: merchant,
+                };
+
+                container.style.border = "2px solid #00aa00";
+                tracking.captured++;
+
+            } catch (err) {
+                conError("Error processing transaction:", err);
+                tracking.failed++;
+                container.style.border = "2px solid #ff0000";
+            }
+
+            updateStatus();
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+
+        // Merge new transactions into state
+        state.transactions = { ...state.transactions, ...newTransactions };
+
+        if (tracking.captured > 0) {
+            state.lastUpdate = new Date().toISOString().replace("T", " ").substring(0, 19);
+            state.transactionCaptures = (state.transactionCaptures || 0) + 1;
+            saveState();
+        }
+
+        setTimeout(() => {
+            captureButton.disabled = false;
+        }, 2000);
+
+        return tracking.captured > 0;
+    };
+
     // UI Components
     const createPanel = () => {
         const panel = document.createElement("div");
+        panel.id = "amazon-exporter-panel";
         panel.style.cssText = `
             position: fixed;
             bottom: 20px;
@@ -426,8 +683,9 @@
             padding: 15px;
             border-radius: 5px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            z-index: 10000;
+            z-index: 2147483647;
             min-width: 200px;
+            pointer-events: auto;
         `;
         return panel;
     };
@@ -579,6 +837,7 @@
 
     const createButton = (icon, tooltip, onClick) => {
         const button = document.createElement("button");
+        button.type = "button"; // Prevent form submission
         button.innerHTML = icon;
         button.title = tooltip;
         button.style.cssText = `
@@ -595,6 +854,7 @@
             justify-content: center;
             font-family: sans-serif;
             position: relative;
+            pointer-events: auto;
         `;
 
         // Add hover styles
@@ -633,11 +893,13 @@
             min-height: 80px;  /* Space for 4 lines */
         `;
 
-        const state = loadState();
+        const currentState = loadState();
+        const transactionCount = currentState.transactions ? Object.keys(currentState.transactions).length : 0;
         info.innerHTML = `
-            <div style="min-height: 20px">Total Orders: ${state.total || ""}</div>
-            <div style="min-height: 20px">Pages Captured: ${state.captures || ""}</div>
-            <div style="min-height: 20px">Last Update: ${state.lastUpdate || ""}</div>
+            <div style="min-height: 20px">Total Orders: ${currentState.total || ""}</div>
+            <div style="min-height: 20px">Order Pages: ${currentState.captures || ""}</div>
+            <div style="min-height: 20px">Transactions: ${transactionCount || ""}</div>
+            <div style="min-height: 20px">Last Update: ${currentState.lastUpdate || ""}</div>
         `;
         panel.appendChild(info);
 
@@ -657,36 +919,85 @@
         buttonContainer.style.alignItems = "center";
         buttonContainer.style.gap = "5px";
 
-        // Add control buttons
-        const startButton = createButton(
-            "📸",
-            state.captures === 0 ? "Start Capturing" : "Capture Page",
-            async () => {
-                const captured = await capturePage(startButton);
-                if (captured) {
-                    updatePanelUI(panel);
+        // Show different buttons based on page type
+        if (isTransactionsPage()) {
+            // Helper to click next page on transactions
+            const goToNextTransactionsPage = () => {
+                const nextBtn = document.querySelector('input[name*="NextPageNavigationEvent"]');
+                if (nextBtn) {
+                    nextBtn.click();
+                } else {
+                    conLog("No next page button found");
                 }
-            },
-        );
+            };
 
-        const captureNextButton = createButton(
-            "⏭️",
-            "Capture & Next Page",
-            async () => {
-                captureNextButton.disabled = true;
-                const captured = await capturePage(captureNextButton);
-                setTimeout(() => {
-                    window.location.href = getNextPageUrl();
-                }, 1000);
-            },
-        );
+            // Transaction page buttons
+            const captureTransButton = createButton(
+                "💳",
+                "Capture Transactions",
+                async () => {
+                    const captured = await captureTransactions(captureTransButton);
+                    if (captured) {
+                        updatePanelUI(panel);
+                    }
+                },
+            );
+            buttonContainer.appendChild(captureTransButton);
 
-        buttonContainer.appendChild(captureNextButton);
+            // Capture & Next button for transactions
+            const captureNextTransButton = createButton(
+                "⏭️",
+                "Capture & Next Page",
+                async () => {
+                    captureNextTransButton.disabled = true;
+                    await captureTransactions(captureNextTransButton);
+                    setTimeout(() => {
+                        goToNextTransactionsPage();
+                    }, 1000);
+                },
+            );
+            buttonContainer.appendChild(captureNextTransButton);
 
-        const nextPageButton = createButton("➡️", "Next Page", () => {
-            window.location.href = getNextPageUrl();
-        });
-        buttonContainer.appendChild(nextPageButton);
+            // Next page button for transactions (uses form submit)
+            const nextTransButton = createButton("➡️", "Next Page", () => {
+                goToNextTransactionsPage();
+            });
+            buttonContainer.appendChild(nextTransButton);
+        } else {
+            // Order page buttons
+            const startButton = createButton(
+                "📸",
+                state.captures === 0 ? "Start Capturing" : "Capture Page",
+                async () => {
+                    const captured = await capturePage(startButton);
+                    if (captured) {
+                        updatePanelUI(panel);
+                    }
+                },
+            );
+
+            const captureNextButton = createButton(
+                "⏭️",
+                "Capture & Next Page",
+                async () => {
+                    captureNextButton.disabled = true;
+                    const captured = await capturePage(captureNextButton);
+                    setTimeout(() => {
+                        window.location.href = getNextPageUrl();
+                    }, 1000);
+                },
+            );
+
+            buttonContainer.appendChild(captureNextButton);
+
+            const nextPageButton = createButton("➡️", "Next Page", () => {
+                window.location.href = getNextPageUrl();
+            });
+            buttonContainer.appendChild(nextPageButton);
+
+            // Add startButton at the end (moved from later)
+            buttonContainer.appendChild(startButton);
+        }
 
         const jsonButton = createButton("📥", "Export JSON", (event) => {
             const data = getJSON();
@@ -730,7 +1041,6 @@
         clearButton.style.marginLeft = "auto"; // Push to right side
         buttonContainer.appendChild(clearButton);
 
-        buttonContainer.appendChild(startButton);
         panel.appendChild(buttonContainer);
     };
 
@@ -756,13 +1066,10 @@
     };
 
     conLog(`Checking URL`);
-    // Check if we're on an orders page
-    if (
-        window.location.href.match(/\/your-orders\/orders/) ||
-        window.location.href.match(/\/order-history/)
-    ) {
+    // Check if we're on an orders page or transactions page
+    if (isOrdersPage() || isTransactionsPage()) {
         try {
-            conLog(`Loading script`);
+            conLog(`Loading script on ${isTransactionsPage() ? 'transactions' : 'orders'} page`);
             init();
         } catch (error) {
             conError(error);
